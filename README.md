@@ -1,59 +1,113 @@
+# Qwen3-Reranker Fine-tuning on Qilin
 
+Fine-tune [Qwen3-Reranker-0.6B](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B) on the [Qilin dataset](https://huggingface.co/datasets/NTCIR-18-Qilin/Qilin) for Chinese social media search reranking.
 
-# Qilin Note Rerank
-## Note Summarization Pipeline
+Uses SFT (cross-entropy on yes/no token) with any-engagement positives.
 
-Pre-processing pipeline that denoises and summarizes candidate notes using an LLM, producing structured cards for downstream reranking.
+## Data Setup
 
-### Files
-
-| File | Description |
-|------|-------------|
-| `main/summarize_notes.py` | Main pipeline script |
-| `main/output/test_notecard.json` | Pre-computed note summaries for the full test set |
-
-### Output Format
-
-`test_notecard.json` maps `note_id (str)` → structured summary string with six fields:
+Download the Qilin dataset from HuggingFace and place files as follows:
 
 ```
-类目: <category>
-关键词: <k1, k2, k3, k4, k5>
-场景: <search scenario, ≤10 chars>
-人群: <target audience>
-实体: <brands / products / people / locations, or 无>
-摘要: <one-sentence search-friendly description>
+data/
+├── notes/
+│   ├── train-00000-of-00005.parquet
+│   ├── train-00001-of-00005.parquet
+│   ├── train-00002-of-00005.parquet
+│   ├── train-00003-of-00005.parquet
+│   └── train-00004-of-00005.parquet
+├── search_train/
+│   └── train-00000-of-00001.parquet
+├── search_test/
+│   └── train-00000-of-00001.parquet
+├── qrels/
+│   └── search.test.qrels.csv
+├── train_notecard.json          ← LLM-generated notecards for search_train (optional)
+└── test_notecard.json           ← LLM-generated notecards for search_test  (optional)
 ```
 
-**Coverage:** 112,595 unique notes drawn from top-100 DPR candidates across all test queries (~5.7% of the 1.98M note corpus).
-
-### How to Run
+Download commands:
 
 ```bash
-conda activate qilin
-cd main
-python3 summarize_notes.py
+pip install huggingface_hub
+
+python - <<'EOF'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="NTCIR-18-Qilin/Qilin",
+    repo_type="dataset",
+    local_dir="data_raw"
+)
+EOF
 ```
 
-Key parameters in the `CONFIG` block at the top of the script:
+Then move the relevant files into `data/` as shown above. The `search.test.qrels.csv` file is the official relevance judgement file from the Qilin task.
 
-| Parameter | Description |
-|-----------|-------------|
-| `sample_start` / `sample_end` | Query index range to process (`None` = all) |
-| `llm_batch_size` | Batch size for LLM inference (4 for 16GB GPU, 32–64 for A100) |
-| `output_path` | Path to save the output JSON |
+Notecards (`train_notecard.json` / `test_notecard.json`) are optional — only needed for `--mode summary` or `--mode combined`. Generate them with `generate_notecards.py` (see below).
 
-To run on a SLURM cluster:
+## Generating Notecards (optional)
+
+Notecards are LLM-generated structured summaries of notes, used for `--mode summary/combined`.
 
 ```bash
-sbatch main/submit1.sh
-tail -f logs/summarize_<jobid>.log
+# Generate notecards for training queries (saves to data/train_notecard.json)
+python generate_notecards.py --split train
+
+# Generate notecards for test queries (saves to data/test_notecard.json)
+python generate_notecards.py --split test
+
+# Custom options
+python generate_notecards.py --split train --batch_size 8 --llm_model Qwen/Qwen3-4B-Instruct
 ```
 
-### Pipeline Steps
+Requires a GPU with sufficient VRAM (≥16GB recommended for batch_size=4).
 
-1. Load `search_test` queries and `notes` corpus from the Qilin dataset
-2. Collect unique candidate note indices from top-100 DPR results
-3. Regex denoise note titles and content (remove hashtags, platform markers, emoji)
-4. Batch-summarize with `Qwen/Qwen3-4B-Instruct` into structured cards
-5. Save to JSON
+## Training
+
+```bash
+# Train on original note text
+python train.py --mode original --prefix run1
+
+# Train on LLM-generated notecards (requires train_notecard.json)
+python train.py --mode summary --prefix run1
+
+# Train on notecard + original text combined
+python train.py --mode combined --prefix run1
+
+# Custom learning rate
+python train.py --mode summary --prefix run1 --lr 5e-6
+```
+
+Checkpoints are saved to `output/{prefix}_qwen3_ft_{mode}/`.
+
+Key hyperparameters (edit `get_config` in `train.py` to change):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `batch_size` | 2 | Per-GPU batch size (effective batch = 4 with accum_steps=2) |
+| `lr` | 1e-5 | Learning rate (override with `--lr`) |
+| `epochs` | 3 | Number of epochs |
+| `neg_per_pos` | 2 | Negatives per positive sample |
+| `max_length` | 256 | Max token length (384 for combined mode) |
+
+## Evaluation
+
+```bash
+# Evaluate a checkpoint with original text at inference
+python eval.py --ckpt_dir output/run1_qwen3_ft_summary --infer_mode original
+
+# Evaluate with summary text at inference
+python eval.py --ckpt_dir output/run1_qwen3_ft_summary --infer_mode summary
+```
+
+Results (MRR@10, MAP@10, Recall@10, Precision@10) are saved to `output/{ckpt_dir}/eval_infer{mode}/metrics.json`.
+
+## Requirements
+
+```
+torch
+transformers
+pandas
+pyarrow
+tqdm
+```
